@@ -704,6 +704,65 @@ update_hosts() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Fix PHP-FPM socket ownership to match the nginx worker user.
+#  When nginx runs as a custom user (not www-data) it cannot connect to a
+#  socket owned by www-data:www-data (mode 660), producing 502 errors.
+# ─────────────────────────────────────────────────────────────────────────────
+fix_fpm_socket_owner() {
+  # Only applies to unix sockets; TCP upstreams need no fix.
+  [[ "$PHP_SOCK" == /* ]] || return 0
+
+  local nginx_user
+  nginx_user=$(awk '/^[[:space:]]*user[[:space:]]/{gsub(/;/,"",$2); print $2; exit}' \
+    /etc/nginx/nginx.conf 2>/dev/null)
+  nginx_user="${nginx_user:-www-data}"
+
+  # www-data is the PHP-FPM default — nothing to do.
+  [[ "$nginx_user" == "www-data" ]] && return 0
+
+  section "🔧  PHP-FPM socket permissions"
+
+  # Locate the pool config that declares this socket path.
+  local pool_conf
+  pool_conf=$(grep -rl "^listen[[:space:]]*=[[:space:]]*${PHP_SOCK}" \
+    /etc/php/*/fpm/pool.d/*.conf 2>/dev/null | head -1)
+
+  if [[ -z "$pool_conf" ]]; then
+    warn "Could not find PHP-FPM pool config for $PHP_SOCK"
+    warn "Manually set listen.owner = $nginx_user in your pool config and restart php-fpm."
+    return 0
+  fi
+
+  local cur_owner
+  cur_owner=$(awk -F'[[:space:]]*=[[:space:]]*' '/^listen\.owner/{print $2; exit}' "$pool_conf")
+
+  if [[ "$cur_owner" == "$nginx_user" ]]; then
+    ok "Socket ownership already correct (${CYAN}$nginx_user${RESET})"
+    return 0
+  fi
+
+  info "nginx worker: ${BOLD}$nginx_user${RESET}  |  socket owner: ${BOLD}${cur_owner:-www-data}${RESET}"
+  info "Patching ${CYAN}$(basename "$pool_conf")${RESET}"
+
+  local key
+  for key in listen.owner listen.group; do
+    if grep -qE "^${key}[[:space:]]*=" "$pool_conf"; then
+      sed -i "s|^${key}[[:space:]]*=.*|${key} = ${nginx_user}|" "$pool_conf"
+    else
+      printf '%s = %s\n' "$key" "$nginx_user" >> "$pool_conf"
+    fi
+  done
+  ok "Set ${CYAN}listen.owner${RESET} / ${CYAN}listen.group${RESET} → ${BOLD}$nginx_user${RESET}"
+
+  local ver svc
+  ver=$(basename "$PHP_SOCK" | sed -E 's/php([0-9.]+)-fpm\.sock/\1/')
+  svc="php${ver}-fpm"
+  spin "Restarting ${svc} to apply new socket ownership" \
+    systemctl restart "$svc" \
+    || warn "Could not restart $svc — run: sudo systemctl restart $svc"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Test config & reload nginx
 # ─────────────────────────────────────────────────────────────────────────────
 reload_nginx() {
@@ -761,6 +820,7 @@ main() {
   make_webroot
   write_vhost
   update_hosts
+  fix_fpm_socket_owner
   reload_nginx
   finish
 }
